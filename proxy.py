@@ -2,11 +2,12 @@
 J.A.R.V.I.S. Proxy Server
 --------------------------
 Central relay between JARVIS clients and Anthropic API.
-Each user has a unique access code.  The admin uses ADMIN_KEY to manage users.
+Users register automatically with their email — no manual code entry needed.
 
 Environment variables (set in Railway dashboard):
   ANTHROPIC_KEY   — your Anthropic API key
   ADMIN_KEY       — secret key for admin endpoints (choose anything strong)
+  APP_SECRET      — secret baked into the JARVIS app (prevents random registrations)
   PORT            — set automatically by Railway (default 8000)
 """
 
@@ -23,9 +24,10 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_KEY = os.environ.get('ANTHROPIC_KEY', '')
 ADMIN_KEY     = os.environ.get('ADMIN_KEY', 'change-me')
+APP_SECRET    = os.environ.get('APP_SECRET', '')   # must match the value baked into JARVIS
 PORT          = int(os.environ.get('PORT', 8000))
 
-USERS_FILE    = Path('users.json')   # persisted on Railway volume (or in-memory on free tier)
+USERS_FILE    = Path('users.json')
 
 ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
 ANTHROPIC_VER = '2023-06-01'
@@ -45,6 +47,24 @@ def save_users(users: dict):
 def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()
 
+def find_user_by_code(code: str):
+    """Returns (name, info) or (None, None)"""
+    users = load_users()
+    h = hash_code(code)
+    for name, info in users.items():
+        if info.get('code_hash') == h and info.get('active', True):
+            return name, info
+    return None, None
+
+def find_user_by_email(email: str):
+    """Returns (name, info) or (None, None)"""
+    users = load_users()
+    email = email.lower().strip()
+    for name, info in users.items():
+        if info.get('email', '').lower() == email:
+            return name, info
+    return None, None
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
 
@@ -62,36 +82,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_stream_chunk(self, data: bytes):
-        self.wfile.write(data)
-        self.wfile.flush()
-
     def read_body(self) -> bytes:
         length = int(self.headers.get('Content-Length', 0))
         return self.rfile.read(length) if length else b''
 
     def check_admin(self) -> bool:
-        key = self.headers.get('X-Admin-Key', '')
-        return key == ADMIN_KEY
+        return self.headers.get('X-Admin-Key', '') == ADMIN_KEY
 
-    def check_user(self) -> tuple[bool, str]:
-        """Returns (valid, username)"""
+    def check_user(self):
+        """Returns (valid, name, info)"""
         code = self.headers.get('X-Access-Code', '')
         if not code:
-            return False, ''
-        users = load_users()
-        h = hash_code(code)
-        for name, info in users.items():
-            if info.get('code_hash') == h and info.get('active', True):
-                return True, name
-        return False, ''
+            return False, '', {}
+        name, info = find_user_by_code(code)
+        if name:
+            return True, name, info
+        return False, '', {}
+
+    def check_app_secret(self) -> bool:
+        if not APP_SECRET:
+            return True  # not configured → open registration
+        return self.headers.get('X-App-Secret', '') == APP_SECRET
 
     # ── CORS preflight ─────────────────────────────────────────────────────────
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Access-Code, X-Admin-Key')
+        self.send_header('Access-Control-Allow-Headers',
+                         'Content-Type, X-Access-Code, X-Admin-Key, X-App-Secret')
         self.end_headers()
 
     # ── GET ────────────────────────────────────────────────────────────────────
@@ -99,11 +118,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # Health check
         if self.path == '/health':
-            self.send_json(200, {'status': 'ok', 'version': '1.0.0'})
+            self.send_json(200, {'status': 'ok', 'version': '1.1.0'})
 
         # Validate access code
         elif self.path == '/validate':
-            valid, name = self.check_user()
+            valid, name, _ = self.check_user()
             if valid:
                 self.send_json(200, {'ok': True, 'name': name})
             else:
@@ -115,12 +134,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(403, {'error': 'Forbidden'})
                 return
             users = load_users()
-            # Don't expose hashes
-            safe = {name: {'active': info.get('active', True),
-                           'created': info.get('created', ''),
-                           'note': info.get('note', '')}
+            safe = {name: {
+                        'active':  info.get('active', True),
+                        'email':   info.get('email', ''),
+                        'created': info.get('created', ''),
+                        'note':    info.get('note', ''),
+                    }
                     for name, info in users.items()}
-            self.send_json(200, {'users': safe})
+            self.send_json(200, {'users': safe, 'count': len(safe)})
 
         else:
             self.send_json(404, {'error': 'Not found'})
@@ -128,9 +149,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ── POST ───────────────────────────────────────────────────────────────────
     def do_POST(self):
 
+        # ── Auto-registration by email ─────────────────────────────────────────
+        if self.path == '/api/register':
+            if not self.check_app_secret():
+                self.send_json(403, {'error': 'Invalid app secret'})
+                return
+            try:
+                data  = json.loads(self.read_body())
+                email = data.get('email', '').lower().strip()
+                if not email or '@' not in email:
+                    self.send_json(400, {'error': 'Valid email required'})
+                    return
+
+                # Already registered? Return existing code (new one)
+                existing_name, existing_info = find_user_by_email(email)
+                if existing_name:
+                    if not existing_info.get('active', True):
+                        self.send_json(403, {'error': 'Account deactivated. Contact admin.'})
+                        return
+                    # Re-issue a new code (old one is invalidated)
+                    users = load_users()
+                    new_code = uuid.uuid4().hex[:20].upper()
+                    users[existing_name]['code_hash'] = hash_code(new_code)
+                    save_users(users)
+                    print(f'[REGISTER] Re-issued code for: {existing_name} ({email})')
+                    self.send_json(200, {'ok': True, 'code': new_code, 'name': existing_name, 'new': False})
+                    return
+
+                # New registration
+                name = email.split('@')[0][:32]  # use email prefix as display name
+                # Ensure unique name
+                users = load_users()
+                base_name = name
+                i = 2
+                while name in users:
+                    name = f'{base_name}{i}'; i += 1
+
+                code = uuid.uuid4().hex[:20].upper()
+                users[name] = {
+                    'email':     email,
+                    'code_hash': hash_code(code),
+                    'active':    True,
+                    'created':   datetime.datetime.now().isoformat()[:16],
+                    'note':      'auto-registered',
+                }
+                save_users(users)
+                print(f'[REGISTER] New user: {name} ({email})')
+                self.send_json(201, {'ok': True, 'code': code, 'name': name, 'new': True})
+
+            except Exception as e:
+                self.send_json(400, {'error': str(e)})
+
         # ── Proxy: forward to Anthropic ────────────────────────────────────────
-        if self.path == '/v1/messages':
-            valid, username = self.check_user()
+        elif self.path == '/v1/messages':
+            valid, username, _ = self.check_user()
             if not valid:
                 self.send_json(401, {'error': 'Invalid or inactive access code'})
                 return
@@ -159,7 +231,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     self.wfile.write(resp_body)
-                    print(f'[PROXY] {username} → {len(body)}B sent, {len(resp_body)}B received')
+                    print(f'[PROXY] {username} → {len(body)}B → {len(resp_body)}B')
 
             except urllib.error.HTTPError as e:
                 err_body = e.read()
@@ -173,15 +245,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as ex:
                 self.send_json(502, {'error': str(ex)})
 
-        # ── Admin: add user ────────────────────────────────────────────────────
+        # ── Admin: add user manually ───────────────────────────────────────────
         elif self.path == '/admin/users':
             if not self.check_admin():
                 self.send_json(403, {'error': 'Forbidden'})
                 return
             try:
-                data = json.loads(self.read_body())
-                name = data.get('name', '').strip()
-                note = data.get('note', '').strip()
+                data  = json.loads(self.read_body())
+                name  = data.get('name', '').strip()
+                email = data.get('email', '').strip().lower()
+                note  = data.get('note', '').strip()
                 if not name:
                     self.send_json(400, {'error': 'name required'})
                     return
@@ -189,18 +262,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if name in users:
                     self.send_json(409, {'error': f'User "{name}" already exists'})
                     return
-                # Generate unique access code
-                code = str(uuid.uuid4()).replace('-', '')[:20].upper()
+                code = uuid.uuid4().hex[:20].upper()
                 users[name] = {
+                    'email':     email,
                     'code_hash': hash_code(code),
-                    'active': True,
-                    'created': datetime.datetime.now().isoformat()[:16],
-                    'note': note,
+                    'active':    True,
+                    'created':   datetime.datetime.now().isoformat()[:16],
+                    'note':      note,
                 }
                 save_users(users)
                 print(f'[ADMIN] Created user: {name}')
-                self.send_json(201, {'ok': True, 'name': name, 'code': code,
-                                     'message': f'Share this code with {name} — it cannot be retrieved later!'})
+                self.send_json(201, {'ok': True, 'name': name, 'code': code})
             except Exception as e:
                 self.send_json(400, {'error': str(e)})
 
@@ -222,7 +294,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             users[name]['active'] = False
             save_users(users)
-            print(f'[ADMIN] Deactivated user: {name}')
+            print(f'[ADMIN] Deactivated: {name}')
             self.send_json(200, {'ok': True, 'message': f'User "{name}" deactivated'})
 
         else:
@@ -231,12 +303,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print('=' * 50)
-    print(f'  J.A.R.V.I.S. Proxy Server v1.0.0')
-    print(f'  Listening on port {PORT}')
+    print('=' * 52)
+    print(f'  J.A.R.V.I.S. Proxy Server v1.1.0')
+    print(f'  Port:          {PORT}')
     print(f'  ANTHROPIC_KEY: {"SET ✓" if ANTHROPIC_KEY else "NOT SET ✗"}')
     print(f'  ADMIN_KEY:     {"SET ✓" if ADMIN_KEY != "change-me" else "DEFAULT — CHANGE IT!"}')
-    print('=' * 50)
-
+    print(f'  APP_SECRET:    {"SET ✓" if APP_SECRET else "open registration (no secret)"}')
+    print('=' * 52)
     server = http.server.HTTPServer(('0.0.0.0', PORT), Handler)
     server.serve_forever()
