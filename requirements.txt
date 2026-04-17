@@ -1,0 +1,2 @@
+# No external dependencies — stdlib only
+# (urllib, http.server, json, uuid, hashlib are all built-in)
