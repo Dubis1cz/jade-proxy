@@ -1,13 +1,16 @@
 """
-J.A.R.V.I.S. Proxy Server
---------------------------
-Central relay between JARVIS clients and Anthropic API.
+J.A.D.E. Proxy Server
+---------------------
+Central relay between JADE clients and Anthropic API.
 Users register automatically with their email — no manual code entry needed.
+Users are stored in Supabase for persistence across Railway redeployments.
 
 Environment variables (set in Railway dashboard):
   ANTHROPIC_KEY   — your Anthropic API key
-  ADMIN_KEY       — secret key for admin endpoints (choose anything strong)
-  APP_SECRET      — secret baked into the JARVIS app (prevents random registrations)
+  ADMIN_KEY       — secret key for admin endpoints
+  APP_SECRET      — secret baked into the JADE app (prevents random registrations)
+  SUPABASE_URL    — Supabase project URL
+  SUPABASE_KEY    — Supabase service_role key
   PORT            — set automatically by Railway (default 8000)
 """
 
@@ -19,36 +22,92 @@ import datetime
 import http.server
 import urllib.request
 import urllib.error
-from pathlib import Path
+import urllib.parse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_KEY = os.environ.get('ANTHROPIC_KEY', '')
 ADMIN_KEY     = os.environ.get('ADMIN_KEY', 'change-me')
-APP_SECRET    = os.environ.get('APP_SECRET', '')   # must match the value baked into JARVIS
+APP_SECRET    = os.environ.get('APP_SECRET', '')
 PORT          = int(os.environ.get('PORT', 8000))
-
-USERS_FILE    = Path('users.json')
+SUPABASE_URL  = os.environ.get('SUPABASE_URL', '').rstrip('/')
+SUPABASE_KEY  = os.environ.get('SUPABASE_KEY', '')
 
 ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages'
 ANTHROPIC_VER = '2023-06-01'
 
-# ── User store ────────────────────────────────────────────────────────────────
+# ── Supabase user store ───────────────────────────────────────────────────────
+def _sb_headers():
+    return {
+        'apikey':        SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type':  'application/json',
+        'Prefer':        'return=representation',
+    }
+
 def load_users() -> dict:
-    if USERS_FILE.exists():
-        try:
-            return json.loads(USERS_FILE.read_text('utf-8'))
-        except Exception:
-            pass
-    return {}
+    """Load all users from Supabase proxy_users table."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return _fallback_load()
+    try:
+        req = urllib.request.Request(
+            f'{SUPABASE_URL}/rest/v1/proxy_users?select=*',
+            headers={**_sb_headers(), 'Prefer': ''},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rows = json.loads(r.read())
+        # Convert list → dict keyed by name
+        return {row['name']: row for row in rows}
+    except Exception as e:
+        print(f'[DB] load_users failed: {e} — falling back to local')
+        return _fallback_load()
 
-def save_users(users: dict):
-    USERS_FILE.write_text(json.dumps(users, indent=2, ensure_ascii=False), 'utf-8')
+def save_user(name: str, data: dict):
+    """Upsert a single user into Supabase."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        _fallback_save_user(name, data)
+        return
+    row = {**data, 'name': name}
+    try:
+        req = urllib.request.Request(
+            f'{SUPABASE_URL}/rest/v1/proxy_users',
+            data=json.dumps(row).encode(),
+            headers={**_sb_headers(), 'Prefer': 'resolution=merge-duplicates,return=minimal'},
+            method='POST',
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f'[DB] save_user failed: {e}')
+        _fallback_save_user(name, data)
 
+def delete_user(name: str):
+    """Deactivate user in Supabase."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        req = urllib.request.Request(
+            f'{SUPABASE_URL}/rest/v1/proxy_users?name=eq.{urllib.parse.quote(name)}',
+            data=json.dumps({'active': False}).encode(),
+            headers={**_sb_headers(), 'Prefer': 'return=minimal'},
+            method='PATCH',
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f'[DB] delete_user failed: {e}')
+
+# ── Local fallback (in-memory) ────────────────────────────────────────────────
+_mem_users: dict = {}
+
+def _fallback_load():
+    return dict(_mem_users)
+
+def _fallback_save_user(name, data):
+    _mem_users[name] = data
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()
 
 def find_user_by_code(code: str):
-    """Returns (name, info) or (None, None)"""
     users = load_users()
     h = hash_code(code)
     for name, info in users.items():
@@ -57,7 +116,6 @@ def find_user_by_code(code: str):
     return None, None
 
 def find_user_by_email(email: str):
-    """Returns (name, info) or (None, None)"""
     users = load_users()
     email = email.lower().strip()
     for name, info in users.items():
@@ -72,7 +130,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ts = datetime.datetime.now().strftime('%H:%M:%S')
         print(f'[{ts}] {fmt % args}')
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
     def send_json(self, code: int, data: dict):
         body = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.send_response(code)
@@ -90,7 +147,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.headers.get('X-Admin-Key', '') == ADMIN_KEY
 
     def check_user(self):
-        """Returns (valid, name, info)"""
         code = self.headers.get('X-Access-Code', '')
         if not code:
             return False, '', {}
@@ -101,10 +157,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_app_secret(self) -> bool:
         if not APP_SECRET:
-            return True  # not configured → open registration
+            return True
         return self.headers.get('X-App-Secret', '') == APP_SECRET
 
-    # ── CORS preflight ─────────────────────────────────────────────────────────
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -113,14 +168,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          'Content-Type, X-Access-Code, X-Admin-Key, X-App-Secret')
         self.end_headers()
 
-    # ── GET ────────────────────────────────────────────────────────────────────
     def do_GET(self):
-
-        # Health check
         if self.path == '/health':
-            self.send_json(200, {'status': 'ok', 'version': '1.1.0'})
+            db = 'supabase' if (SUPABASE_URL and SUPABASE_KEY) else 'memory'
+            self.send_json(200, {'status': 'ok', 'version': '1.2.0', 'storage': db})
 
-        # Validate access code
         elif self.path == '/validate':
             valid, name, _ = self.check_user()
             if valid:
@@ -128,95 +180,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(401, {'ok': False, 'error': 'Invalid or inactive access code'})
 
-        # Admin: list users
         elif self.path == '/admin/users':
             if not self.check_admin():
-                self.send_json(403, {'error': 'Forbidden'})
-                return
+                self.send_json(403, {'error': 'Forbidden'}); return
             users = load_users()
             safe = {name: {
                         'active':  info.get('active', True),
                         'email':   info.get('email', ''),
                         'created': info.get('created', ''),
                         'note':    info.get('note', ''),
-                    }
-                    for name, info in users.items()}
+                    } for name, info in users.items()}
             self.send_json(200, {'users': safe, 'count': len(safe)})
 
         else:
             self.send_json(404, {'error': 'Not found'})
 
-    # ── POST ───────────────────────────────────────────────────────────────────
     def do_POST(self):
 
-        # ── Auto-registration by email ─────────────────────────────────────────
+        # ── Auto-registration ──────────────────────────────────────────────────
         if self.path == '/api/register':
             if not self.check_app_secret():
-                self.send_json(403, {'error': 'Invalid app secret'})
-                return
+                self.send_json(403, {'error': 'Invalid app secret'}); return
             try:
                 data  = json.loads(self.read_body())
                 email = data.get('email', '').lower().strip()
                 if not email or '@' not in email:
-                    self.send_json(400, {'error': 'Valid email required'})
-                    return
+                    self.send_json(400, {'error': 'Valid email required'}); return
 
-                # Already registered? Return existing code (new one)
                 existing_name, existing_info = find_user_by_email(email)
                 if existing_name:
                     if not existing_info.get('active', True):
-                        self.send_json(403, {'error': 'Account deactivated. Contact admin.'})
-                        return
-                    # Re-issue a new code (old one is invalidated)
-                    users = load_users()
+                        self.send_json(403, {'error': 'Account deactivated.'}); return
+                    # Re-issue new code
                     new_code = uuid.uuid4().hex[:20].upper()
-                    users[existing_name]['code_hash'] = hash_code(new_code)
-                    save_users(users)
-                    print(f'[REGISTER] Re-issued code for: {existing_name} ({email})')
+                    existing_info['code_hash'] = hash_code(new_code)
+                    save_user(existing_name, existing_info)
+                    print(f'[REGISTER] Re-issued: {existing_name} ({email})')
                     self.send_json(200, {'ok': True, 'code': new_code, 'name': existing_name, 'new': False})
                     return
 
-                # New registration
-                name = email.split('@')[0][:32]  # use email prefix as display name
-                # Ensure unique name
+                # New user
+                name = email.split('@')[0][:32]
                 users = load_users()
-                base_name = name
-                i = 2
+                base_name = name; i = 2
                 while name in users:
                     name = f'{base_name}{i}'; i += 1
 
                 code = uuid.uuid4().hex[:20].upper()
-                users[name] = {
+                user_data = {
                     'email':     email,
                     'code_hash': hash_code(code),
                     'active':    True,
                     'created':   datetime.datetime.now().isoformat()[:16],
                     'note':      'auto-registered',
                 }
-                save_users(users)
-                print(f'[REGISTER] New user: {name} ({email})')
+                save_user(name, user_data)
+                print(f'[REGISTER] New: {name} ({email})')
                 self.send_json(201, {'ok': True, 'code': code, 'name': name, 'new': True})
 
             except Exception as e:
                 self.send_json(400, {'error': str(e)})
 
-        # ── Proxy: forward to Anthropic ────────────────────────────────────────
+        # ── Proxy to Anthropic ─────────────────────────────────────────────────
         elif self.path == '/v1/messages':
             valid, username, _ = self.check_user()
             if not valid:
-                self.send_json(401, {'error': 'Invalid or inactive access code'})
-                return
-
+                self.send_json(401, {'error': 'Invalid or inactive access code'}); return
             if not ANTHROPIC_KEY:
-                self.send_json(500, {'error': 'Server not configured — ANTHROPIC_KEY missing'})
-                return
+                self.send_json(500, {'error': 'Server not configured — ANTHROPIC_KEY missing'}); return
 
             body = self.read_body()
             try:
                 req = urllib.request.Request(
-                    ANTHROPIC_URL,
-                    data=body,
-                    method='POST',
+                    ANTHROPIC_URL, data=body, method='POST',
                     headers={
                         'Content-Type':      'application/json',
                         'x-api-key':         ANTHROPIC_KEY,
@@ -232,7 +268,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(resp_body)
                     print(f'[PROXY] {username} → {len(body)}B → {len(resp_body)}B')
-
             except urllib.error.HTTPError as e:
                 err_body = e.read()
                 self.send_response(e.code)
@@ -241,37 +276,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(err_body)
-
             except Exception as ex:
                 self.send_json(502, {'error': str(ex)})
 
-        # ── Admin: add user manually ───────────────────────────────────────────
+        # ── Admin: add user ────────────────────────────────────────────────────
         elif self.path == '/admin/users':
             if not self.check_admin():
-                self.send_json(403, {'error': 'Forbidden'})
-                return
+                self.send_json(403, {'error': 'Forbidden'}); return
             try:
                 data  = json.loads(self.read_body())
                 name  = data.get('name', '').strip()
                 email = data.get('email', '').strip().lower()
-                note  = data.get('note', '').strip()
                 if not name:
-                    self.send_json(400, {'error': 'name required'})
-                    return
+                    self.send_json(400, {'error': 'name required'}); return
                 users = load_users()
                 if name in users:
-                    self.send_json(409, {'error': f'User "{name}" already exists'})
-                    return
+                    self.send_json(409, {'error': f'User "{name}" already exists'}); return
                 code = uuid.uuid4().hex[:20].upper()
-                users[name] = {
-                    'email':     email,
-                    'code_hash': hash_code(code),
-                    'active':    True,
-                    'created':   datetime.datetime.now().isoformat()[:16],
-                    'note':      note,
+                user_data = {
+                    'email': email, 'code_hash': hash_code(code),
+                    'active': True, 'created': datetime.datetime.now().isoformat()[:16],
+                    'note': data.get('note', ''),
                 }
-                save_users(users)
-                print(f'[ADMIN] Created user: {name}')
+                save_user(name, user_data)
+                print(f'[ADMIN] Created: {name}')
                 self.send_json(201, {'ok': True, 'name': name, 'code': code})
             except Exception as e:
                 self.send_json(400, {'error': str(e)})
@@ -279,24 +307,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_json(404, {'error': 'Not found'})
 
-    # ── DELETE ─────────────────────────────────────────────────────────────────
     def do_DELETE(self):
-
-        # Admin: deactivate user  DELETE /admin/users/<name>
         if self.path.startswith('/admin/users/'):
             if not self.check_admin():
-                self.send_json(403, {'error': 'Forbidden'})
-                return
+                self.send_json(403, {'error': 'Forbidden'}); return
             name = self.path.split('/')[-1]
             users = load_users()
             if name not in users:
-                self.send_json(404, {'error': f'User "{name}" not found'})
-                return
-            users[name]['active'] = False
-            save_users(users)
+                self.send_json(404, {'error': f'User "{name}" not found'}); return
+            delete_user(name)
             print(f'[ADMIN] Deactivated: {name}')
-            self.send_json(200, {'ok': True, 'message': f'User "{name}" deactivated'})
-
+            self.send_json(200, {'ok': True})
         else:
             self.send_json(404, {'error': 'Not found'})
 
@@ -304,11 +325,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print('=' * 52)
-    print(f'  J.A.R.V.I.S. Proxy Server v1.1.0')
+    print(f'  J.A.D.E. Proxy Server v1.2.0')
     print(f'  Port:          {PORT}')
     print(f'  ANTHROPIC_KEY: {"SET ✓" if ANTHROPIC_KEY else "NOT SET ✗"}')
     print(f'  ADMIN_KEY:     {"SET ✓" if ADMIN_KEY != "change-me" else "DEFAULT — CHANGE IT!"}')
-    print(f'  APP_SECRET:    {"SET ✓" if APP_SECRET else "open registration (no secret)"}')
+    print(f'  APP_SECRET:    {"SET ✓" if APP_SECRET else "open registration"}')
+    storage = "Supabase ✓" if (SUPABASE_URL and SUPABASE_KEY) else "in-memory (set SUPABASE vars!)"
+    print(f'  STORAGE:       {storage}')
     print('=' * 52)
     server = http.server.HTTPServer(('0.0.0.0', PORT), Handler)
     server.serve_forever()
